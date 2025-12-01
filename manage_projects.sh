@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Define the paths to your 7 sub-projects
+# Define the paths to your sub-projects
 declare -a SUB_PROJECTS=(
     "/path/to/project1"
     "/path/to/project2"
@@ -19,102 +19,54 @@ is_git_repository() {
     fi
 }
 
-# Function to increment the version (e.g., dev.1.1.20 -> dev.1.1.21)
-increment_version() {
-    local current_version=$1
-    # Split into prefix and version number; increment the patch version
-    local prefix=$(echo "$current_version" | cut -d. -f1)  # e.g., 'dev'
-    local version_numbers=$(echo "$current_version" | cut -d. -f2-)  # e.g., '1.1.20'
-    local new_version=$(echo "$version_numbers" | awk -F. '{print $1 "." $2 "." $3+1}')
-    echo "$prefix.$new_version"
-}
+# Function for handling merge_branch option
+merge_branches() {
+    echo "Enter the branch you want to merge from: "
+    read -r SOURCE_BRANCH
 
-# Function to resolve conflicts and choose the correct version
-resolve_version_conflict() {
-    local dependency_name=$1
-    echo "Conflict detected in $dependency_name. Please choose the environment for resolution:"
-    echo "1) Development (dev)"
-    echo "2) Quality Assurance (qa)"
-    echo "3) Staging (stage)"
-    echo "4) Production (prod)"
-    echo "Enter your choice (1/2/3/4): "
-    read -r ENV_CHOICE
+    echo "Enter the branch you want to merge into: "
+    read -r TARGET_BRANCH
 
-    case $ENV_CHOICE in
-        1) echo "dev";;
-        2) echo "qa";;
-        3) echo "stage";;
-        4) echo "prod";;
-        *) echo "Invalid choice. Defaulting to 'dev'."; echo "dev";;
-    esac
-}
-
-# Function to update the project's version in its pom.xml
-update_pom_version() {
-    local project_path=$1
-    local current_env=$2
-
-    # Retrieve the current version
-    local current_version=$(grep -m 1 "<version>" "$project_path/pom.xml" | sed -E 's|.*<version>([a-zA-Z]+\.[0-9]+\.[0-9]+\.[0-9]+)</version>.*|\1|')
-    if [[ -z "$current_version" ]]; then
-        echo "Unable to find the current version in $project_path."
-        return
+    if [[ -z "$SOURCE_BRANCH" || -z "$TARGET_BRANCH" ]]; then
+        echo "Both source and target branches must be specified. Exiting."
+        return 1
     fi
 
-    # Determine whether to increment or resolve conflicts
-    if [[ -n $(grep "<<<<<<<" "$project_path/pom.xml") ]]; then
-        echo "Merge conflict detected in $project_path/pom.xml."
-        local resolved_env=$(resolve_version_conflict "$(basename "$project_path")")
-        local prefix=$(echo "$current_version" | cut -d. -f1)
-        local resolved_version="$resolved_env.$(echo "$current_version" | cut -d. -f2-)"
-        echo "Resolved version: $resolved_version"
-        sed -i '' -E "s|<version>.*</version>|<version>$resolved_version</version>|g" "$project_path/pom.xml"
-    else
-        # Increment logically
-        local new_version=$(increment_version "$current_version")
-        echo "Updating version in $project_path/pom.xml to $new_version"
-        sed -i '' -E "s|<version>.*</version>|<version>$new_version</version>|g" "$project_path/pom.xml"
-    fi
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
 
-    echo "Version update completed for $project_path."
-}
+        # Check if the directory is a valid Git repository
+        is_git_repository || continue
 
-# Function to update dependencies in pom.xml
-update_dependency_versions() {
-    local project_path=$1
-    declare -n updated_versions=$2  # Associative array {project_path -> version}
+        # Checkout the target branch
+        echo "Switching to target branch: $TARGET_BRANCH"
+        git checkout "$TARGET_BRANCH" || { echo "Failed to switch to $TARGET_BRANCH in $(pwd). Skipping."; continue; }
 
-    for dependency_project in "${!updated_versions[@]}"; do
-        local dependency_version=${updated_versions[$dependency_project]}
-        local dependency_project_name=$(basename "$dependency_project")
-        # Only update dependencies that are part of configured SUB_PROJECTS
-        if [[ " ${SUB_PROJECTS[*]} " == *"$dependency_project"* ]]; then
-            echo "Updating dependency $dependency_project_name to version $dependency_version in $project_path"
-            sed -i '' -E "s|(<artifactId>$dependency_project_name</artifactId>.*<version>)[^<]+(<\/version>)|\1$dependency_version\2|g" "$project_path/pom.xml"
+        # Pull the latest changes for the target branch
+        echo "Pulling latest changes on target branch: $TARGET_BRANCH"
+        git pull || { echo "Failed to pull on $TARGET_BRANCH. Skipping."; continue; }
+
+        # Merge the source branch into the target branch
+        echo "Merging branch $SOURCE_BRANCH into $TARGET_BRANCH..."
+        git merge --no-edit "$SOURCE_BRANCH"
+
+        # Check if the merge resulted in conflicts
+        if [[ $? -ne 0 ]]; then
+            echo "Conflicts detected in $(pwd)."
+            echo "Conflicts left unresolved. Please resolve manually later."
+            
+            # Optionally log unresolved conflicts details
+            LOG_FILE="/tmp/merge_conflicts.log"
+            echo "Conflicts in project: $PROJECT" >> "$LOG_FILE"
+            git status --porcelain | grep "^UU" >> "$LOG_FILE"
+
+            # Skip the project without committing
+            continue
         fi
+
+        echo "Merge completed successfully for $PROJECT."
     done
-}
-
-# Option 6: Update versions and dependencies
-update_versions() {
-    declare -A updated_versions  # Associative array {project_path -> version}
-
-    # Update all project versions
-    for project in "${SUB_PROJECTS[@]}"; do
-        echo "Processing project: $project"
-        update_pom_version "$project" # Update version and resolve conflicts if any
-        local current_version=$(grep -m 1 "<version>" "$project/pom.xml" | sed -E 's|.*<version>(.*)</version>.*|\1|')
-        updated_versions["$project"]="$current_version"
-    done
-
-    echo "Starting dependency updates in all projects..."
-
-    # Update dependencies across all projects
-    for project in "${SUB_PROJECTS[@]}"; do
-        update_dependency_versions "$project" updated_versions
-    done
-
-    echo "Dependency and version updates completed successfully."
 }
 
 # Function for pull and rebase
@@ -139,6 +91,116 @@ pull_and_rebase() {
         echo "Pulling the latest changes..."
         git pull --rebase
     done
+}
+
+# Function to commit changes across all projects
+commit_all_changes() {
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
+
+        # Check if the directory is a valid Git repository
+        is_git_repository || continue
+
+        # Check for uncommitted changes
+        if [[ -n $(git status --porcelain) ]]; then
+            echo "Uncommitted changes found in $(pwd)."
+            git add .
+            echo "Enter a commit message for $(pwd): "
+            read -r COMMIT_MESSAGE
+            if [[ -z "$COMMIT_MESSAGE" ]]; then
+                echo "Commit message cannot be empty. Skipping commit."
+                continue
+            fi
+            git commit -m "$COMMIT_MESSAGE"
+        else
+            echo "No uncommitted changes in $(pwd)."
+        fi
+    done
+}
+
+# Function to push changes for PR creation
+push_all_changes() {
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
+
+        # Check if the directory is a valid Git repository
+        is_git_repository || continue
+
+        echo "Pushing changes..."
+        git push || { echo "Failed to push changes for $PROJECT. Skipping."; continue; }
+    done
+}
+
+# Dummy function to create a new branch after pulling
+create_branch() {
+    echo "Enter the new branch name: "
+    read -r NEW_BRANCH
+
+    if [[ -z "$NEW_BRANCH" ]]; then
+        echo "Branch name cannot be empty. Exiting."
+        return 1
+    fi
+
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
+
+        # Check if the directory is a valid Git repository
+        is_git_repository || continue
+
+        echo "Fetching updates..."
+        git fetch
+
+        echo "Creating new branch: $NEW_BRANCH"
+        git checkout -b "$NEW_BRANCH"
+    done
+}
+
+# Function to update versions and dependencies across projects
+update_versions() {
+    declare -A updated_versions
+
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || continue
+
+        # Retrieve the current version from pom.xml
+        local CURRENT_VERSION=$(grep -m 1 "<version>" "$PROJECT/pom.xml" | sed -E 's|.*<version>([a-zA-Z]+\.[0-9]+\.[0-9]+\.[0-9]+)</version>.*|\1|')
+
+        if [[ -z "$CURRENT_VERSION" ]]; then
+            echo "Unable to find the current version for $PROJECT. Skipping."
+            continue
+        fi
+
+        echo "Current version for project $(basename "$PROJECT"): $CURRENT_VERSION"
+
+        # Increment the version (e.g., qa.1.1.20 -> qa.1.1.21)
+        local PREFIX=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+        local VERSION_NUMBERS=$(echo "$CURRENT_VERSION" | cut -d. -f2-)
+        local NEW_VERSION="$PREFIX.$(echo "$VERSION_NUMBERS" | awk -F. '{print $1 "." $2 "." $3+1}')"
+
+        # Update the pom.xml version
+        sed -i '' -E "s|<version>$CURRENT_VERSION</version>|<version>$NEW_VERSION</version>|g" "$PROJECT/pom.xml"
+
+        echo "Updated version to $NEW_VERSION in $PROJECT."
+
+        # Save the new version to be used for dependency updates
+        updated_versions["$PROJECT"]="$NEW_VERSION"
+    done
+
+    # Update dependencies in all `pom.xml` files
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        cd "$PROJECT" || continue
+        for DEP_PROJECT in "${!updated_versions[@]}"; do
+            local DEP_VERSION=${updated_versions["$DEP_PROJECT"]}
+            local ARTIFACT_NAME=$(basename "$DEP_PROJECT")
+            sed -i '' -E "s|(<artifactId>$ARTIFACT_NAME</artifactId>.*<version>)[^<]+(<\/version>)|\1$DEP_VERSION\2|g" "$PROJECT/pom.xml"
+        done
+    done
+
+    echo "Versions and dependencies updated successfully."
 }
 
 # Main workflow to offer user choices
