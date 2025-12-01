@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Define the paths to your sub-projects
+# Define the paths to your sub-projects and their corresponding artifactIds
 declare -a SUB_PROJECTS=(
     "/path/to/project1"
     "/path/to/project2"
@@ -9,6 +9,17 @@ declare -a SUB_PROJECTS=(
     "/path/to/project5"
     "/path/to/project6"
     "/path/to/project7"
+)
+
+# Define the artifactIds corresponding to the sub-projects
+declare -a ARTIFACT_IDS=(
+    "project1-artifact"
+    "project2-artifact"
+    "project3-artifact"
+    "project4-artifact"
+    "project5-artifact"
+    "project6-artifact"
+    "project7-artifact"
 )
 
 # Function to check if the directory is a valid Git repository
@@ -55,7 +66,7 @@ merge_branches() {
         if [[ $? -ne 0 ]]; then
             echo "Conflicts detected in $(pwd)."
             echo "Conflicts left unresolved. Please resolve manually later."
-            
+
             # Optionally log unresolved conflicts details
             LOG_FILE="/tmp/merge_conflicts.log"
             echo "Conflicts in project: $PROJECT" >> "$LOG_FILE"
@@ -133,7 +144,7 @@ push_all_changes() {
     done
 }
 
-# Dummy function to create a new branch after pulling
+# Function to create a new branch
 create_branch() {
     echo "Enter the new branch name: "
     read -r NEW_BRANCH
@@ -158,49 +169,75 @@ create_branch() {
     done
 }
 
-# Function to update versions and dependencies across projects
+# Function to update project versions and dependencies
 update_versions() {
-    declare -A updated_versions
+    for i in "${!SUB_PROJECTS[@]}"; do
+        PROJECT=${SUB_PROJECTS[$i]}
+        ARTIFACT_ID=${ARTIFACT_IDS[$i]}
 
-    for PROJECT in "${SUB_PROJECTS[@]}"; do
-        echo "Processing project: $PROJECT"
+        echo "Processing project: $PROJECT with artifactId: $ARTIFACT_ID"
         cd "$PROJECT" || continue
 
-        # Retrieve the current version from pom.xml
-        local CURRENT_VERSION=$(grep -m 1 "<version>" "$PROJECT/pom.xml" | sed -E 's|.*<version>([a-zA-Z]+\.[0-9]+\.[0-9]+\.[0-9]+)</version>.*|\1|')
-
+        # Find the current version from pom.xml matching the artifactId
+        CURRENT_VERSION=$(grep -A1 "<artifactId>$ARTIFACT_ID</artifactId>" "pom.xml" | grep "<version>" | sed -E 's|.*<version>([^<]+)</version>.*|\1|')
         if [[ -z "$CURRENT_VERSION" ]]; then
-            echo "Unable to find the current version for $PROJECT. Skipping."
+            echo "Unable to find the current version for artifactId $ARTIFACT_ID in project $PROJECT. Skipping."
             continue
         fi
 
-        echo "Current version for project $(basename "$PROJECT"): $CURRENT_VERSION"
+        echo "Current version for $ARTIFACT_ID: $CURRENT_VERSION"
 
-        # Increment the version (e.g., qa.1.1.20 -> qa.1.1.21)
-        local PREFIX=$(echo "$CURRENT_VERSION" | cut -d. -f1)
-        local VERSION_NUMBERS=$(echo "$CURRENT_VERSION" | cut -d. -f2-)
-        local NEW_VERSION="$PREFIX.$(echo "$VERSION_NUMBERS" | awk -F. '{print $1 "." $2 "." $3+1}')"
+        # Increment the version
+        PREFIX=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+        VERSION_NUMBERS=$(echo "$CURRENT_VERSION" | cut -d. -f2-)
+        NEW_VERSION="$PREFIX.$(echo "$VERSION_NUMBERS" | awk -F. '{print $1 "." $2 "." $3+1}')"
 
-        # Update the pom.xml version
-        sed -i '' -E "s|<version>$CURRENT_VERSION</version>|<version>$NEW_VERSION</version>|g" "$PROJECT/pom.xml"
+        # Update the version in the pom.xml
+        sed -i '' -E "s|<artifactId>$ARTIFACT_ID</artifactId>.*<version>$CURRENT_VERSION</version>|<artifactId>$ARTIFACT_ID</artifactId><version>$NEW_VERSION</version>|g" "pom.xml"
+        echo "Updated $ARTIFACT_ID version to $NEW_VERSION in $PROJECT."
 
-        echo "Updated version to $NEW_VERSION in $PROJECT."
-
-        # Save the new version to be used for dependency updates
-        updated_versions["$PROJECT"]="$NEW_VERSION"
-    done
-
-    # Update dependencies in all `pom.xml` files
-    for PROJECT in "${SUB_PROJECTS[@]}"; do
-        cd "$PROJECT" || continue
-        for DEP_PROJECT in "${!updated_versions[@]}"; do
-            local DEP_VERSION=${updated_versions["$DEP_PROJECT"]}
-            local ARTIFACT_NAME=$(basename "$DEP_PROJECT")
-            sed -i '' -E "s|(<artifactId>$ARTIFACT_NAME</artifactId>.*<version>)[^<]+(<\/version>)|\1$DEP_VERSION\2|g" "$PROJECT/pom.xml"
+        # Update dependencies in downstream projects
+        for j in $(seq $((i + 1)) ${#SUB_PROJECTS[@]}); do
+            DOWNSTREAM_PROJECT=${SUB_PROJECTS[$j]}
+            echo "Updating dependency $ARTIFACT_ID to version $NEW_VERSION in $DOWNSTREAM_PROJECT..."
+            cd "$DOWNSTREAM_PROJECT" || continue
+            sed -i '' -E "s|<artifactId>$ARTIFACT_ID</artifactId>.*<version>[^<]+</version>|<artifactId>$ARTIFACT_ID</artifactId><version>$NEW_VERSION</version>|g" "pom.xml"
         done
     done
+}
 
-    echo "Versions and dependencies updated successfully."
+# NEW FUNCTION: Commit all changes after conflict resolution
+commit_after_merge_conflict() {
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
+
+        # Commit manually resolved conflicts, if present
+        if [[ -n $(git status --porcelain) ]]; then
+            git add .
+            echo "Enter a commit message for resolved conflicts in $PROJECT: "
+            read -r COMMIT_MESSAGE
+            if [[ -n "$COMMIT_MESSAGE" ]]; then
+                git commit -m "$COMMIT_MESSAGE"
+                echo "Added commit for resolved conflicts in $PROJECT."
+            else
+                echo "Commit message cannot be empty. Skipping $PROJECT."
+            fi
+        else
+            echo "No changes to commit in $PROJECT."
+        fi
+    done
+}
+
+# NEW FUNCTION: Show git status for all projects
+status_all_projects() {
+    for PROJECT in "${SUB_PROJECTS[@]}"; do
+        echo "Git status for project: $PROJECT"
+        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
+        is_git_repository || continue
+        git status
+        echo ""
+    done
 }
 
 # Main workflow to offer user choices
@@ -212,7 +249,10 @@ main_workflow() {
     echo "4) Commit all changes and push branches across projects for PR creation"
     echo "5) Merge one branch into another across all projects"
     echo "6) Update versions and dependencies across all projects"
-    echo "Enter your choice (1/2/3/4/5/6): "
+    echo "7) Commit all changes after manually resolving conflicts"
+    echo "8) Show git status across all projects"
+
+    echo "Enter your choice (1/2/3/4/5/6/7/8): "
     read -r CHOICE
 
     case $CHOICE in
@@ -222,6 +262,8 @@ main_workflow() {
         4) push_all_changes ;;
         5) merge_branches ;;
         6) update_versions ;;
+        7) commit_after_merge_conflict ;;
+        8) status_all_projects ;;
         *) echo "Invalid choice. Exiting."; exit 1 ;;
     esac
 }
