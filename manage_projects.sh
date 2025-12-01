@@ -11,32 +11,7 @@ declare -a SUB_PROJECTS=(
     "/path/to/project7"
 )
 
-# Function to check for uncommitted changes
-check_uncommitted_changes() {
-    if [[ -n $(git status --porcelain) ]]; then
-        # There are uncommitted changes
-        echo "Uncommitted changes found in $(pwd). Preparing to commit them..."
-        git add .
-        echo "Enter a commit message for changes in $(pwd): "
-        read -r commit_message
-        if [[ -z "$commit_message" ]]; then
-            echo "Commit message cannot be empty. Skipping commit."
-            return 1
-        fi
-        git commit -m "$commit_message" || { echo "Failed to commit changes in $(pwd). Aborting."; return 1; }
-        echo "Committed changes in $(pwd)."
-    else
-        echo "No uncommitted changes in $(pwd)."
-    fi
-}
-
-# Function to handle failures during a Git command
-handle_git_failure() {
-    echo "Error encountered in $(pwd). Aborting processing for this project."
-    return 1
-}
-
-# Function to verify if a Git repository is valid
+# Function to check if the directory is a valid Git repository
 is_git_repository() {
     if [[ ! -d ".git" ]]; then
         echo "Directory $(pwd) is not a valid Git repository. Skipping."
@@ -44,26 +19,105 @@ is_git_repository() {
     fi
 }
 
-# Main workflow
-main_workflow() {
-    echo "What would you like to do? Choose an option:"
-    echo "1) Check branch status, pull, and rebase across all projects"
-    echo "2) Create a new branch across all projects after pulling"
-    echo "3) Commit all changes across projects"
-    echo "4) Commit all changes and push branches across projects for PR creation"
-    echo "Enter your choice (1/2/3/4): "
-    read -r CHOICE
+# Function to increment the version (e.g., dev.1.1.20 -> dev.1.1.21)
+increment_version() {
+    local current_version=$1
+    # Split into prefix and version number; increment the patch version
+    local prefix=$(echo "$current_version" | cut -d. -f1)  # e.g., 'dev'
+    local version_numbers=$(echo "$current_version" | cut -d. -f2-)  # e.g., '1.1.20'
+    local new_version=$(echo "$version_numbers" | awk -F. '{print $1 "." $2 "." $3+1}')
+    echo "$prefix.$new_version"
+}
 
-    case $CHOICE in
-        1) pull_and_rebase ;;
-        2) create_branch ;;
-        3) commit_all_changes ;;
-        4) push_all_changes ;;
-        *) echo "Invalid choice. Exiting."; exit 1 ;;
+# Function to resolve conflicts and choose the correct version
+resolve_version_conflict() {
+    local dependency_name=$1
+    echo "Conflict detected in $dependency_name. Please choose the environment for resolution:"
+    echo "1) Development (dev)"
+    echo "2) Quality Assurance (qa)"
+    echo "3) Staging (stage)"
+    echo "4) Production (prod)"
+    echo "Enter your choice (1/2/3/4): "
+    read -r ENV_CHOICE
+
+    case $ENV_CHOICE in
+        1) echo "dev";;
+        2) echo "qa";;
+        3) echo "stage";;
+        4) echo "prod";;
+        *) echo "Invalid choice. Defaulting to 'dev'."; echo "dev";;
     esac
 }
 
-# Option 1: Pull and rebase across all projects
+# Function to update the project's version in its pom.xml
+update_pom_version() {
+    local project_path=$1
+    local current_env=$2
+
+    # Retrieve the current version
+    local current_version=$(grep -m 1 "<version>" "$project_path/pom.xml" | sed -E 's|.*<version>([a-zA-Z]+\.[0-9]+\.[0-9]+\.[0-9]+)</version>.*|\1|')
+    if [[ -z "$current_version" ]]; then
+        echo "Unable to find the current version in $project_path."
+        return
+    fi
+
+    # Determine whether to increment or resolve conflicts
+    if [[ -n $(grep "<<<<<<<" "$project_path/pom.xml") ]]; then
+        echo "Merge conflict detected in $project_path/pom.xml."
+        local resolved_env=$(resolve_version_conflict "$(basename "$project_path")")
+        local prefix=$(echo "$current_version" | cut -d. -f1)
+        local resolved_version="$resolved_env.$(echo "$current_version" | cut -d. -f2-)"
+        echo "Resolved version: $resolved_version"
+        sed -i '' -E "s|<version>.*</version>|<version>$resolved_version</version>|g" "$project_path/pom.xml"
+    else
+        # Increment logically
+        local new_version=$(increment_version "$current_version")
+        echo "Updating version in $project_path/pom.xml to $new_version"
+        sed -i '' -E "s|<version>.*</version>|<version>$new_version</version>|g" "$project_path/pom.xml"
+    fi
+
+    echo "Version update completed for $project_path."
+}
+
+# Function to update dependencies in pom.xml
+update_dependency_versions() {
+    local project_path=$1
+    declare -n updated_versions=$2  # Associative array {project_path -> version}
+
+    for dependency_project in "${!updated_versions[@]}"; do
+        local dependency_version=${updated_versions[$dependency_project]}
+        local dependency_project_name=$(basename "$dependency_project")
+        # Only update dependencies that are part of configured SUB_PROJECTS
+        if [[ " ${SUB_PROJECTS[*]} " == *"$dependency_project"* ]]; then
+            echo "Updating dependency $dependency_project_name to version $dependency_version in $project_path"
+            sed -i '' -E "s|(<artifactId>$dependency_project_name</artifactId>.*<version>)[^<]+(<\/version>)|\1$dependency_version\2|g" "$project_path/pom.xml"
+        fi
+    done
+}
+
+# Option 6: Update versions and dependencies
+update_versions() {
+    declare -A updated_versions  # Associative array {project_path -> version}
+
+    # Update all project versions
+    for project in "${SUB_PROJECTS[@]}"; do
+        echo "Processing project: $project"
+        update_pom_version "$project" # Update version and resolve conflicts if any
+        local current_version=$(grep -m 1 "<version>" "$project/pom.xml" | sed -E 's|.*<version>(.*)</version>.*|\1|')
+        updated_versions["$project"]="$current_version"
+    done
+
+    echo "Starting dependency updates in all projects..."
+
+    # Update dependencies across all projects
+    for project in "${SUB_PROJECTS[@]}"; do
+        update_dependency_versions "$project" updated_versions
+    done
+
+    echo "Dependency and version updates completed successfully."
+}
+
+# Function for pull and rebase
 pull_and_rebase() {
     echo "Enter the branch you want to pull/rebase and switch to: "
     read -r TARGET_BRANCH
@@ -80,115 +134,35 @@ pull_and_rebase() {
         # Check if the directory is a valid Git repository
         is_git_repository || continue
 
-        CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Failed to retrieve the current branch for $(pwd). Skipping."
-            continue
-        fi
-        echo "Current branch: $CURRENT_BRANCH"
-
-        # Check for uncommitted changes
-        check_uncommitted_changes || continue
-
-        # Check if the branch exists locally
-        if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
-            echo "Switching to branch: $TARGET_BRANCH"
-            git checkout "$TARGET_BRANCH" || { handle_git_failure; continue; }
-            echo "Pulling latest changes from origin/$TARGET_BRANCH..."
-            git pull --rebase || { handle_git_failure; continue; }
-        else
-            echo "Branch $TARGET_BRANCH does not exist locally."
-            echo "Enter the base branch from which to create $TARGET_BRANCH: "
-            read -r BASE_BRANCH
-            if [[ -z "$BASE_BRANCH" ]]; then
-                echo "Base branch cannot be empty. Skipping."
-                continue
-            fi
-            echo "Creating and switching to branch $TARGET_BRANCH from $BASE_BRANCH..."
-            git checkout "$BASE_BRANCH" || { handle_git_failure; continue; }
-            git pull || { handle_git_failure; continue; }
-            git checkout -b "$TARGET_BRANCH" || { handle_git_failure; continue; }
-        fi
-
-        echo "Processed $PROJECT"
+        echo "Switching to branch: $TARGET_BRANCH"
+        git checkout "$TARGET_BRANCH"
+        echo "Pulling the latest changes..."
+        git pull --rebase
     done
 }
 
-# Option 2: Create a new branch across all projects
-create_branch() {
-    echo "Enter the new branch name: "
-    read -r NEW_BRANCH
+# Main workflow to offer user choices
+main_workflow() {
+    echo "What would you like to do? Choose an option:"
+    echo "1) Check branch status, pull, and rebase across all projects"
+    echo "2) Create a new branch across all projects after pulling"
+    echo "3) Commit all changes across projects"
+    echo "4) Commit all changes and push branches across projects for PR creation"
+    echo "5) Merge one branch into another across all projects"
+    echo "6) Update versions and dependencies across all projects"
+    echo "Enter your choice (1/2/3/4/5/6): "
+    read -r CHOICE
 
-    if [[ -z "$NEW_BRANCH" ]]; then
-        echo "Branch name cannot be empty. Exiting."
-        return 1
-    fi
-
-    for PROJECT in "${SUB_PROJECTS[@]}"; do
-        echo "Processing project: $PROJECT"
-        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
-
-        # Check if the directory is a valid Git repository
-        is_git_repository || continue
-
-        echo "Enter the base branch to create $NEW_BRANCH from in project $PROJECT: "
-        read -r BASE_BRANCH
-
-        if [[ -z "$BASE_BRANCH" ]]; then
-            echo "Base branch cannot be empty. Skipping."
-            continue
-        fi
-
-        echo "Pulling latest changes from $BASE_BRANCH..."
-        git checkout "$BASE_BRANCH" || { handle_git_failure; continue; }
-        git pull || { handle_git_failure; continue; }
-
-        echo "Creating and switching to new branch: $NEW_BRANCH..."
-        git checkout -b "$NEW_BRANCH" || { handle_git_failure; continue; }
-
-        echo "Branch $NEW_BRANCH has been created in $PROJECT."
-    done
-}
-
-# Option 3: Commit all changes across projects
-commit_all_changes() {
-    for PROJECT in "${SUB_PROJECTS[@]}"; do
-        echo "Processing project: $PROJECT"
-        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
-
-        # Check if the directory is a valid Git repository
-        is_git_repository || continue
-
-        check_uncommitted_changes || continue
-    done
-}
-
-# Option 4: Commit and push all changes across projects
-push_all_changes() {
-    for PROJECT in "${SUB_PROJECTS[@]}"; do
-        echo "Processing project: $PROJECT"
-        cd "$PROJECT" || { echo "Failed to access $PROJECT. Skipping."; continue; }
-
-        # Check if the directory is a valid Git repository
-        is_git_repository || continue
-
-        check_uncommitted_changes || continue
-
-        CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Failed to retrieve current branch in $(pwd). Skipping."
-            continue
-        fi
-
-        echo "Pushing changes in branch $CURRENT_BRANCH to origin..."
-        git push -u origin "$CURRENT_BRANCH" || { echo "Failed to push changes for $(pwd). Skipping."; continue; }
-
-        echo "Changes pushed successfully for $PROJECT."
-    done
+    case $CHOICE in
+        1) pull_and_rebase ;;
+        2) create_branch ;;
+        3) commit_all_changes ;;
+        4) push_all_changes ;;
+        5) merge_branches ;;
+        6) update_versions ;;
+        *) echo "Invalid choice. Exiting."; exit 1 ;;
+    esac
 }
 
 # Run the main workflow
 main_workflow
-
-#   chmod +x manage_projects.sh
-#   ./manage_projects.sh
